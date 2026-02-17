@@ -1,0 +1,15 @@
+{
+  "name": "chat-websocket-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for chat application - Deploy on Render.com",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
