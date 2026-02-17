@@ -1,14 +1,8 @@
-/**
- * 🚀 Chat WebSocket Server for Render.com
- * 
- * این سرور را در Render.com دیپلوی کنید
- * رایگان، پایدار و با HTTPS خودکار
- */
-
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const PORT = process.env.PORT || 3001;
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -27,30 +21,29 @@ let data = {
 if (fs.existsSync(DATA_FILE)) {
   try {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    console.log('📂 Data loaded successfully');
   } catch (e) {
-    console.log('⚠️ Error loading data, starting fresh');
+    console.log('Error loading data, starting fresh');
   }
 }
 
 // Save data
 function saveData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Error saving data:', e);
-  }
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Auto-save every 30 seconds
-setInterval(saveData, 30000);
+// Generate Recovery Code
+function generateRecoveryCode() {
+  const segment1 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const segment2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const segment3 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  return `${segment1}-${segment2}-${segment3}`;
+}
 
 // Online users
-const onlineUsers = new Map();
+const onlineUsers = new Map(); // userId -> WebSocket
 
-// HTTP server
+// HTTP server for health check
 const server = http.createServer((req, res) => {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -61,16 +54,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   
-  // Health check endpoint (برای UptimeRobot)
-  if (req.url === '/health' || req.url === '/') {
+  if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ 
-      status: 'ok',
-      message: '🟢 Chat Server is running!',
+      status: 'ok', 
       users: Object.keys(data.users).length,
-      online: onlineUsers.size,
-      uptime: Math.floor(process.uptime()),
-      timestamp: new Date().toISOString()
+      online: onlineUsers.size
     }));
   } else {
     res.writeHead(404);
@@ -124,24 +113,13 @@ function ensureChat(userId, partnerId) {
   }
 }
 
-function getAllUserMessages(userId) {
-  const userMessages = {};
-  for (const chatId of Object.keys(data.messages)) {
-    const [user1, user2] = chatId.split(':');
-    if (user1 === userId || user2 === userId) {
-      userMessages[chatId] = data.messages[chatId];
-    }
-  }
-  return userMessages;
-}
-
 // WebSocket connection handler
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   let currentUserId = null;
-  const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   
-  console.log(`📱 New connection from ${clientIP}`);
+  console.log('📱 New connection');
   
+  // Send connection confirmation
   sendTo(ws, 'connected', { timestamp: Date.now() });
   
   ws.on('message', (rawMessage) => {
@@ -152,6 +130,7 @@ wss.on('connection', (ws, req) => {
         case 'register': {
           const { id, username, displayName, avatar, bio } = msgData;
           
+          // Check if username exists
           const existingUser = Object.values(data.users).find(
             u => u.username.toLowerCase() === username.toLowerCase() && u.id !== id
           );
@@ -161,6 +140,8 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
+          const recoveryCode = generateRecoveryCode();
+
           const user = {
             id,
             username,
@@ -169,7 +150,8 @@ wss.on('connection', (ws, req) => {
             bio,
             isOnline: true,
             lastSeen: Date.now(),
-            isDeleted: false
+            isDeleted: false,
+            recoveryCode
           };
           
           data.users[id] = user;
@@ -193,11 +175,11 @@ wss.on('connection', (ws, req) => {
             blockedBy: data.blockedBy[id] || [],
             pinnedChats: data.pinnedChats[id] || [],
             pinnedMessages: data.pinnedMessages[id] || {},
-            onlineUsers: getOnlineUserIds()
+            onlineUsers: getOnlineUserIds(),
+            recoveryCode // Send code to user
           });
           
           broadcast({ type: 'user_joined', data: { user, onlineUsers: getOnlineUserIds() } }, ws);
-          console.log(`✅ User registered: ${displayName} (@${username})`);
           break;
         }
         
@@ -232,8 +214,43 @@ wss.on('connection', (ws, req) => {
             type: 'user_online', 
             data: { userId, onlineUsers: getOnlineUserIds() } 
           }, ws);
+          break;
+        }
+
+        case 'login_recovery': {
+          const { code } = msgData;
           
-          console.log(`✅ User logged in: ${data.users[userId].displayName}`);
+          const user = Object.values(data.users).find(u => u.recoveryCode === code && !u.isDeleted);
+          
+          if (!user) {
+            sendTo(ws, 'login_error', { error: 'کد بازیابی نامعتبر است' });
+            return;
+          }
+
+          const userId = user.id;
+          currentUserId = userId;
+          onlineUsers.set(userId, ws);
+          
+          data.users[userId].isOnline = true;
+          data.users[userId].lastSeen = Date.now();
+          saveData();
+          
+          sendTo(ws, 'login_success', {
+            user: data.users[userId],
+            users: data.users,
+            chats: data.chats[userId] || {},
+            messages: getAllUserMessages(userId),
+            blocked: data.blocked[userId] || [],
+            blockedBy: data.blockedBy[userId] || [],
+            pinnedChats: data.pinnedChats[userId] || [],
+            pinnedMessages: data.pinnedMessages[userId] || {},
+            onlineUsers: getOnlineUserIds()
+          });
+          
+          broadcast({ 
+            type: 'user_online', 
+            data: { userId, onlineUsers: getOnlineUserIds() } 
+          }, ws);
           break;
         }
         
@@ -261,11 +278,13 @@ wss.on('connection', (ws, req) => {
           
           const { id, chatId, senderId, receiverId, text, replyTo } = msgData;
           
+          // Check if blocked
           if (data.blocked[receiverId]?.includes(senderId)) {
             sendTo(ws, 'message_blocked', { error: 'شما توسط این کاربر بلاک شده‌اید' });
             return;
           }
           
+          // Check if receiver is deleted
           if (data.users[receiverId]?.isDeleted) {
             sendTo(ws, 'message_blocked', { error: 'این کاربر حذف شده است' });
             return;
@@ -281,12 +300,15 @@ wss.on('connection', (ws, req) => {
             timestamp: Date.now(),
             status: 'sent',
             isEdited: false,
-            isDeleted: false
+            isDeleted: false,
+            reactions: {}
           };
           
+          // Save message
           if (!data.messages[chatId]) data.messages[chatId] = [];
           data.messages[chatId].push(message);
           
+          // Update chats for both users
           ensureChat(senderId, receiverId);
           ensureChat(receiverId, senderId);
           
@@ -300,11 +322,13 @@ wss.on('connection', (ws, req) => {
           
           saveData();
           
+          // Send to sender
           sendTo(ws, 'message_sent', { 
             message: { ...message, status: 'sent' },
             chats: data.chats[senderId]
           });
           
+          // Send to receiver
           const receiverWs = onlineUsers.get(receiverId);
           if (receiverWs) {
             message.status = 'delivered';
@@ -313,8 +337,11 @@ wss.on('connection', (ws, req) => {
               chats: data.chats[receiverId],
               senderId
             });
+            
+            // Notify sender of delivery
             sendTo(ws, 'message_delivered', { messageId: id, chatId });
           }
+          
           break;
         }
         
@@ -328,6 +355,7 @@ wss.on('connection', (ws, req) => {
               msg.isEdited = true;
               saveData();
               
+              // Notify all parties
               const [user1, user2] = chatId.split(':');
               [user1, user2].forEach(userId => {
                 sendToUser(userId, 'message_edited', { chatId, messageId, newText });
@@ -353,6 +381,43 @@ wss.on('connection', (ws, req) => {
           }
           break;
         }
+
+        case 'add_reaction': {
+          const { chatId, messageId, userId, emoji } = msgData;
+          
+          if (data.messages[chatId]) {
+            const msg = data.messages[chatId].find(m => m.id === messageId);
+            if (msg) {
+              if (!msg.reactions) msg.reactions = {};
+              msg.reactions[userId] = emoji;
+              saveData();
+              
+              const [user1, user2] = chatId.split(':');
+              [user1, user2].forEach(uid => {
+                sendToUser(uid, 'reaction_added', { chatId, messageId, userId, emoji });
+              });
+            }
+          }
+          break;
+        }
+
+        case 'remove_reaction': {
+          const { chatId, messageId, userId } = msgData;
+          
+          if (data.messages[chatId]) {
+            const msg = data.messages[chatId].find(m => m.id === messageId);
+            if (msg && msg.reactions) {
+              delete msg.reactions[userId];
+              saveData();
+              
+              const [user1, user2] = chatId.split(':');
+              [user1, user2].forEach(uid => {
+                sendToUser(uid, 'reaction_removed', { chatId, messageId, userId });
+              });
+            }
+          }
+          break;
+        }
         
         case 'mark_seen': {
           const { chatId, userId, partnerId } = msgData;
@@ -371,6 +436,7 @@ wss.on('connection', (ws, req) => {
           
           saveData();
           
+          // Notify sender that messages were seen
           sendToUser(partnerId, 'messages_seen', { chatId, seenBy: userId });
           sendTo(ws, 'unread_cleared', { partnerId });
           break;
@@ -396,7 +462,14 @@ wss.on('connection', (ws, req) => {
             }
           }
           
-          data.users[userId] = { ...data.users[userId], ...updates };
+          // Preserve recovery code if exists
+          const existingUser = data.users[userId];
+          data.users[userId] = { 
+            ...existingUser, 
+            ...updates,
+            recoveryCode: existingUser.recoveryCode 
+          };
+          
           saveData();
           
           sendTo(ws, 'profile_updated', { user: data.users[userId] });
@@ -414,7 +487,8 @@ wss.on('connection', (ws, req) => {
             avatar: '👤',
             bio: '',
             isDeleted: true,
-            isOnline: false
+            isOnline: false,
+            recoveryCode: null // Remove recovery code
           };
           
           saveData();
@@ -476,13 +550,16 @@ wss.on('connection', (ws, req) => {
         case 'delete_chat': {
           const { userId, partnerId } = msgData;
           
+          // Delete chat from user's list
           if (data.chats[userId]) {
             delete data.chats[userId][partnerId];
           }
           
+          // Delete messages
           const chatId = getChatId(userId, partnerId);
           delete data.messages[chatId];
           
+          // Remove from pinned
           if (data.pinnedChats[userId]) {
             data.pinnedChats[userId] = data.pinnedChats[userId].filter(id => id !== partnerId);
           }
@@ -559,23 +636,22 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Keep-alive ping
-setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
+// Get all messages for a user
+function getAllUserMessages(userId) {
+  const userMessages = {};
+  
+  // Get messages from all chats this user is part of
+  for (const chatId of Object.keys(data.messages)) {
+    const [user1, user2] = chatId.split(':');
+    if (user1 === userId || user2 === userId) {
+      userMessages[chatId] = data.messages[chatId];
     }
-  });
-}, 30000);
+  }
+  
+  return userMessages;
+}
 
 // Start server
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('');
-  console.log('🚀 ═══════════════════════════════════════════════');
-  console.log('   Chat WebSocket Server');
-  console.log('═══════════════════════════════════════════════════');
-  console.log(`   🌐 Port: ${PORT}`);
-  console.log(`   📊 Health: http://localhost:${PORT}/health`);
-  console.log('═══════════════════════════════════════════════════');
-  console.log('');
+  console.log('\n🚀 Chat Server running on port', PORT);
 });
