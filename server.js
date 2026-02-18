@@ -1,9 +1,12 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3001;
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-// In-memory data store
+// Load data
 let data = {
   users: {},
   messages: {},
@@ -13,6 +16,19 @@ let data = {
   pinnedChats: {},
   pinnedMessages: {}
 };
+
+if (fs.existsSync(DATA_FILE)) {
+  try {
+    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (e) {
+    console.log('Error loading data, starting fresh');
+  }
+}
+
+// Save data
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
 
 // Generate recovery code
 function generateRecoveryCode() {
@@ -40,13 +56,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   
-  if (req.url === '/health' || req.url === '/') {
+  if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ 
       status: 'ok', 
       users: Object.keys(data.users).length,
-      online: onlineUsers.size,
-      uptime: process.uptime()
+      online: onlineUsers.size
     }));
   } else {
     res.writeHead(404);
@@ -71,9 +86,9 @@ function broadcast(message, excludeWs = null) {
   });
 }
 
-function sendTo(ws, type, msgData) {
+function sendTo(ws, type, data) {
   if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type, data: msgData }));
+    ws.send(JSON.stringify({ type, data }));
   }
 }
 
@@ -98,17 +113,6 @@ function ensureChat(userId, partnerId) {
       updatedAt: Date.now()
     };
   }
-}
-
-function getAllUserMessages(userId) {
-  const userMessages = {};
-  for (const chatId of Object.keys(data.messages)) {
-    const [user1, user2] = chatId.split(':');
-    if (user1 === userId || user2 === userId) {
-      userMessages[chatId] = data.messages[chatId];
-    }
-  }
-  return userMessages;
 }
 
 // WebSocket connection handler
@@ -159,6 +163,8 @@ wss.on('connection', (ws) => {
           currentUserId = id;
           onlineUsers.set(id, ws);
           
+          saveData();
+          
           sendTo(ws, 'register_success', {
             user,
             users: data.users,
@@ -188,6 +194,7 @@ wss.on('connection', (ws) => {
           
           data.users[userId].isOnline = true;
           data.users[userId].lastSeen = Date.now();
+          saveData();
           
           sendTo(ws, 'login_success', {
             user: data.users[userId],
@@ -226,6 +233,7 @@ wss.on('connection', (ws) => {
           
           data.users[user.id].isOnline = true;
           data.users[user.id].lastSeen = Date.now();
+          saveData();
           
           sendTo(ws, 'login_success', {
             user: data.users[user.id],
@@ -308,6 +316,8 @@ wss.on('connection', (ws) => {
           data.chats[receiverId][senderId].unreadCount = 
             (data.chats[receiverId][senderId].unreadCount || 0) + 1;
           
+          saveData();
+          
           sendTo(ws, 'message_sent', { 
             message: { ...message, status: 'sent' },
             chats: data.chats[senderId]
@@ -336,6 +346,7 @@ wss.on('connection', (ws) => {
             if (msg && msg.senderId === currentUserId) {
               msg.text = newText;
               msg.isEdited = true;
+              saveData();
               
               const [user1, user2] = chatId.split(':');
               [user1, user2].forEach(userId => {
@@ -350,13 +361,28 @@ wss.on('connection', (ws) => {
           const { chatId, messageIds } = msgData;
           
           if (data.messages[chatId]) {
+            // First, remove deleted messages from pinned messages for both users
+            const [user1, user2] = chatId.split(':');
+            [user1, user2].forEach(userId => {
+              if (data.pinnedMessages[userId]?.[chatId]) {
+                data.pinnedMessages[userId][chatId] = 
+                  data.pinnedMessages[userId][chatId].filter(id => !messageIds.includes(id));
+              }
+            });
+            
+            // Then delete the messages
             data.messages[chatId] = data.messages[chatId].filter(
               m => !messageIds.includes(m.id)
             );
+            saveData();
             
-            const [user1, user2] = chatId.split(':');
+            // Notify both users with updated pinned messages
             [user1, user2].forEach(userId => {
-              sendToUser(userId, 'message_deleted', { chatId, messageIds });
+              sendToUser(userId, 'message_deleted', { 
+                chatId, 
+                messageIds,
+                pinnedMessages: data.pinnedMessages[userId]?.[chatId] || []
+              });
             });
           }
           break;
@@ -376,6 +402,8 @@ wss.on('connection', (ws) => {
           if (data.chats[userId]?.[partnerId]) {
             data.chats[userId][partnerId].unreadCount = 0;
           }
+          
+          saveData();
           
           sendToUser(partnerId, 'messages_seen', { chatId, seenBy: userId });
           sendTo(ws, 'unread_cleared', { partnerId });
@@ -403,6 +431,7 @@ wss.on('connection', (ws) => {
           }
           
           data.users[userId] = { ...data.users[userId], ...updates };
+          saveData();
           
           sendTo(ws, 'profile_updated', { user: data.users[userId] });
           broadcast({ type: 'user_updated', data: { user: { ...data.users[userId], recoveryCode: undefined } } }, ws);
@@ -422,6 +451,8 @@ wss.on('connection', (ws) => {
             isOnline: false,
             recoveryCode: null
           };
+          
+          saveData();
           
           sendTo(ws, 'account_deleted', {});
           broadcast({ type: 'user_deleted', data: { 
@@ -452,6 +483,8 @@ wss.on('connection', (ws) => {
             data.blockedBy[targetId] = data.blockedBy[targetId].filter(id => id !== userId);
           }
           
+          saveData();
+          
           sendTo(ws, 'user_blocked', { blocked: data.blocked[userId] });
           sendToUser(targetId, 'you_were_blocked', { blockedBy: data.blockedBy[targetId] });
           break;
@@ -470,6 +503,7 @@ wss.on('connection', (ws) => {
             data.pinnedChats[userId] = data.pinnedChats[userId].filter(id => id !== partnerId);
           }
           
+          saveData();
           sendTo(ws, 'chat_pinned', { pinnedChats: data.pinnedChats[userId] });
           break;
         }
@@ -488,6 +522,8 @@ wss.on('connection', (ws) => {
             data.pinnedChats[userId] = data.pinnedChats[userId].filter(id => id !== partnerId);
           }
           
+          saveData();
+          
           sendTo(ws, 'chat_deleted', { 
             partnerId,
             chats: data.chats[userId] || {}
@@ -499,6 +535,7 @@ wss.on('connection', (ws) => {
           const { chatId, messageId, isPinned, oderId } = msgData;
           const [user1, user2] = chatId.split(':');
           
+          // Update pinned messages for both users
           [user1, user2].forEach(userId => {
             if (!data.pinnedMessages[userId]) data.pinnedMessages[userId] = {};
             if (!data.pinnedMessages[userId][chatId]) data.pinnedMessages[userId][chatId] = [];
@@ -513,6 +550,7 @@ wss.on('connection', (ws) => {
             }
           });
           
+          // Create system message for pin
           let systemMessage = null;
           if (isPinned) {
             const pinner = data.users[oderId];
@@ -534,6 +572,8 @@ wss.on('connection', (ws) => {
             data.messages[chatId].push(systemMessage);
           }
           
+          saveData();
+          
           [user1, user2].forEach(userId => {
             sendToUser(userId, 'message_pinned', { 
               chatId, 
@@ -546,7 +586,7 @@ wss.on('connection', (ws) => {
         
         case 'add_reaction': {
           const { chatId, messageId, oderId, emoji } = msgData;
-          const oderId2 = oderId;
+          const oderId2 = oderId; // For compatibility
           
           if (data.messages[chatId]) {
             const msg = data.messages[chatId].find(m => m.id === messageId);
@@ -569,6 +609,8 @@ wss.on('connection', (ws) => {
                 // Add new reaction
                 msg.reactions.push({ userId: oderId2, emoji });
               }
+              
+              saveData();
               
               const [user1, user2] = chatId.split(':');
               [user1, user2].forEach(userId => {
@@ -604,6 +646,7 @@ wss.on('connection', (ws) => {
       if (data.users[currentUserId]) {
         data.users[currentUserId].isOnline = false;
         data.users[currentUserId].lastSeen = Date.now();
+        saveData();
       }
       
       broadcast({ 
@@ -622,6 +665,21 @@ wss.on('connection', (ws) => {
   });
 });
 
+function getAllUserMessages(userId) {
+  const userMessages = {};
+  
+  for (const chatId of Object.keys(data.messages)) {
+    const [user1, user2] = chatId.split(':');
+    if (user1 === userId || user2 === userId) {
+      userMessages[chatId] = data.messages[chatId];
+    }
+  }
+  
+  return userMessages;
+}
+
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Chat Server running on port ${PORT}`);
+  console.log('\n🚀 Chat Server running on port', PORT);
+  console.log('   Health check: /health');
+  console.log('');
 });
