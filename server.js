@@ -31,18 +31,35 @@ function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Generate Recovery Code
+// Generate recovery code
 function generateRecoveryCode() {
-  const segment1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const segment2 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const segment3 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `${segment1}-${segment2}-${segment3}`;
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 12; i++) {
+    if (i > 0 && i % 4 === 0) code += '-';
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+// Get network IPs
+function getNetworkIPs() {
+  const interfaces = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ips.push(iface.address);
+      }
+    }
+  }
+  return ips;
 }
 
 // Online users
-const onlineUsers = new Map(); // userId -> WebSocket
+const onlineUsers = new Map();
 
-// HTTP server for health check
+// HTTP server
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -118,8 +135,6 @@ wss.on('connection', (ws) => {
   let currentUserId = null;
   
   console.log('📱 New connection');
-  
-  // Send connection confirmation
   sendTo(ws, 'connected', { timestamp: Date.now() });
   
   ws.on('message', (rawMessage) => {
@@ -130,7 +145,6 @@ wss.on('connection', (ws) => {
         case 'register': {
           const { id, username, displayName, avatar, bio } = msgData;
           
-          // Check if username exists
           const existingUser = Object.values(data.users).find(
             u => u.username.toLowerCase() === username.toLowerCase() && u.id !== id
           );
@@ -141,7 +155,7 @@ wss.on('connection', (ws) => {
           }
           
           const recoveryCode = generateRecoveryCode();
-
+          
           const user = {
             id,
             username,
@@ -175,11 +189,10 @@ wss.on('connection', (ws) => {
             blockedBy: data.blockedBy[id] || [],
             pinnedChats: data.pinnedChats[id] || [],
             pinnedMessages: data.pinnedMessages[id] || {},
-            onlineUsers: getOnlineUserIds(),
-            recoveryCode // Send code to user
+            onlineUsers: getOnlineUserIds()
           });
           
-          broadcast({ type: 'user_joined', data: { user, onlineUsers: getOnlineUserIds() } }, ws);
+          broadcast({ type: 'user_joined', data: { user: { ...user, recoveryCode: undefined }, onlineUsers: getOnlineUserIds() } }, ws);
           break;
         }
         
@@ -216,40 +229,42 @@ wss.on('connection', (ws) => {
           }, ws);
           break;
         }
-
+        
         case 'login_recovery': {
-          const { code } = msgData;
+          const { recoveryCode } = msgData;
+          const cleanCode = recoveryCode.replace(/-/g, '').toUpperCase();
           
-          const user = Object.values(data.users).find(u => u.recoveryCode === code && !u.isDeleted);
+          const user = Object.values(data.users).find(
+            u => u.recoveryCode && u.recoveryCode.replace(/-/g, '') === cleanCode && !u.isDeleted
+          );
           
           if (!user) {
             sendTo(ws, 'login_error', { error: 'کد بازیابی نامعتبر است' });
             return;
           }
-
-          const userId = user.id;
-          currentUserId = userId;
-          onlineUsers.set(userId, ws);
           
-          data.users[userId].isOnline = true;
-          data.users[userId].lastSeen = Date.now();
+          currentUserId = user.id;
+          onlineUsers.set(user.id, ws);
+          
+          data.users[user.id].isOnline = true;
+          data.users[user.id].lastSeen = Date.now();
           saveData();
           
           sendTo(ws, 'login_success', {
-            user: data.users[userId],
+            user: data.users[user.id],
             users: data.users,
-            chats: data.chats[userId] || {},
-            messages: getAllUserMessages(userId),
-            blocked: data.blocked[userId] || [],
-            blockedBy: data.blockedBy[userId] || [],
-            pinnedChats: data.pinnedChats[userId] || [],
-            pinnedMessages: data.pinnedMessages[userId] || {},
+            chats: data.chats[user.id] || {},
+            messages: getAllUserMessages(user.id),
+            blocked: data.blocked[user.id] || [],
+            blockedBy: data.blockedBy[user.id] || [],
+            pinnedChats: data.pinnedChats[user.id] || [],
+            pinnedMessages: data.pinnedMessages[user.id] || {},
             onlineUsers: getOnlineUserIds()
           });
           
           broadcast({ 
             type: 'user_online', 
-            data: { userId, onlineUsers: getOnlineUserIds() } 
+            data: { userId: user.id, onlineUsers: getOnlineUserIds() } 
           }, ws);
           break;
         }
@@ -269,7 +284,7 @@ wss.on('connection', (ws) => {
           const user = Object.values(data.users).find(
             u => u.username.toLowerCase() === searchTerm && !u.isDeleted
           );
-          sendTo(ws, 'search_result', { user: user || null });
+          sendTo(ws, 'search_result', { user: user ? { ...user, recoveryCode: undefined } : null });
           break;
         }
         
@@ -278,13 +293,11 @@ wss.on('connection', (ws) => {
           
           const { id, chatId, senderId, receiverId, text, replyTo } = msgData;
           
-          // Check if blocked
           if (data.blocked[receiverId]?.includes(senderId)) {
             sendTo(ws, 'message_blocked', { error: 'شما توسط این کاربر بلاک شده‌اید' });
             return;
           }
           
-          // Check if receiver is deleted
           if (data.users[receiverId]?.isDeleted) {
             sendTo(ws, 'message_blocked', { error: 'این کاربر حذف شده است' });
             return;
@@ -301,14 +314,12 @@ wss.on('connection', (ws) => {
             status: 'sent',
             isEdited: false,
             isDeleted: false,
-            reactions: {}
+            reactions: []
           };
           
-          // Save message
           if (!data.messages[chatId]) data.messages[chatId] = [];
           data.messages[chatId].push(message);
           
-          // Update chats for both users
           ensureChat(senderId, receiverId);
           ensureChat(receiverId, senderId);
           
@@ -322,13 +333,11 @@ wss.on('connection', (ws) => {
           
           saveData();
           
-          // Send to sender
           sendTo(ws, 'message_sent', { 
             message: { ...message, status: 'sent' },
             chats: data.chats[senderId]
           });
           
-          // Send to receiver
           const receiverWs = onlineUsers.get(receiverId);
           if (receiverWs) {
             message.status = 'delivered';
@@ -338,7 +347,6 @@ wss.on('connection', (ws) => {
               senderId
             });
             
-            // Notify sender of delivery
             sendTo(ws, 'message_delivered', { messageId: id, chatId });
           }
           
@@ -355,7 +363,6 @@ wss.on('connection', (ws) => {
               msg.isEdited = true;
               saveData();
               
-              // Notify all parties
               const [user1, user2] = chatId.split(':');
               [user1, user2].forEach(userId => {
                 sendToUser(userId, 'message_edited', { chatId, messageId, newText });
@@ -381,43 +388,6 @@ wss.on('connection', (ws) => {
           }
           break;
         }
-
-        case 'add_reaction': {
-          const { chatId, messageId, userId, emoji } = msgData;
-          
-          if (data.messages[chatId]) {
-            const msg = data.messages[chatId].find(m => m.id === messageId);
-            if (msg) {
-              if (!msg.reactions) msg.reactions = {};
-              msg.reactions[userId] = emoji;
-              saveData();
-              
-              const [user1, user2] = chatId.split(':');
-              [user1, user2].forEach(uid => {
-                sendToUser(uid, 'reaction_added', { chatId, messageId, userId, emoji });
-              });
-            }
-          }
-          break;
-        }
-
-        case 'remove_reaction': {
-          const { chatId, messageId, userId } = msgData;
-          
-          if (data.messages[chatId]) {
-            const msg = data.messages[chatId].find(m => m.id === messageId);
-            if (msg && msg.reactions) {
-              delete msg.reactions[userId];
-              saveData();
-              
-              const [user1, user2] = chatId.split(':');
-              [user1, user2].forEach(uid => {
-                sendToUser(uid, 'reaction_removed', { chatId, messageId, userId });
-              });
-            }
-          }
-          break;
-        }
         
         case 'mark_seen': {
           const { chatId, userId, partnerId } = msgData;
@@ -436,7 +406,6 @@ wss.on('connection', (ws) => {
           
           saveData();
           
-          // Notify sender that messages were seen
           sendToUser(partnerId, 'messages_seen', { chatId, seenBy: userId });
           sendTo(ws, 'unread_cleared', { partnerId });
           break;
@@ -462,18 +431,11 @@ wss.on('connection', (ws) => {
             }
           }
           
-          // Preserve recovery code if exists
-          const existingUser = data.users[userId];
-          data.users[userId] = { 
-            ...existingUser, 
-            ...updates,
-            recoveryCode: existingUser.recoveryCode 
-          };
-          
+          data.users[userId] = { ...data.users[userId], ...updates };
           saveData();
           
           sendTo(ws, 'profile_updated', { user: data.users[userId] });
-          broadcast({ type: 'user_updated', data: { user: data.users[userId] } }, ws);
+          broadcast({ type: 'user_updated', data: { user: { ...data.users[userId], recoveryCode: undefined } } }, ws);
           break;
         }
         
@@ -488,7 +450,7 @@ wss.on('connection', (ws) => {
             bio: '',
             isDeleted: true,
             isOnline: false,
-            recoveryCode: null // Remove recovery code
+            recoveryCode: null
           };
           
           saveData();
@@ -550,16 +512,13 @@ wss.on('connection', (ws) => {
         case 'delete_chat': {
           const { userId, partnerId } = msgData;
           
-          // Delete chat from user's list
           if (data.chats[userId]) {
             delete data.chats[userId][partnerId];
           }
           
-          // Delete messages
           const chatId = getChatId(userId, partnerId);
           delete data.messages[chatId];
           
-          // Remove from pinned
           if (data.pinnedChats[userId]) {
             data.pinnedChats[userId] = data.pinnedChats[userId].filter(id => id !== partnerId);
           }
@@ -574,25 +533,96 @@ wss.on('connection', (ws) => {
         }
         
         case 'pin_message': {
-          const { chatId, messageId, isPinned } = msgData;
+          const { chatId, messageId, isPinned, oderId } = msgData;
+          const [user1, user2] = chatId.split(':');
           
-          if (!data.pinnedMessages[currentUserId]) data.pinnedMessages[currentUserId] = {};
-          if (!data.pinnedMessages[currentUserId][chatId]) data.pinnedMessages[currentUserId][chatId] = [];
-          
-          if (isPinned) {
-            if (!data.pinnedMessages[currentUserId][chatId].includes(messageId)) {
-              data.pinnedMessages[currentUserId][chatId].push(messageId);
+          // Update pinned messages for both users
+          [user1, user2].forEach(userId => {
+            if (!data.pinnedMessages[userId]) data.pinnedMessages[userId] = {};
+            if (!data.pinnedMessages[userId][chatId]) data.pinnedMessages[userId][chatId] = [];
+            
+            if (isPinned) {
+              if (!data.pinnedMessages[userId][chatId].includes(messageId)) {
+                data.pinnedMessages[userId][chatId].push(messageId);
+              }
+            } else {
+              data.pinnedMessages[userId][chatId] = 
+                data.pinnedMessages[userId][chatId].filter(id => id !== messageId);
             }
-          } else {
-            data.pinnedMessages[currentUserId][chatId] = 
-              data.pinnedMessages[currentUserId][chatId].filter(id => id !== messageId);
+          });
+          
+          // Create system message for pin
+          let systemMessage = null;
+          if (isPinned) {
+            const pinner = data.users[oderId];
+            systemMessage = {
+              id: `sys_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              chatId,
+              senderId: oderId,
+              receiverId: user1 === oderId ? user2 : user1,
+              text: `${pinner?.displayName || 'کاربر'} پیامی را سنجاق کرد`,
+              timestamp: Date.now(),
+              status: 'sent',
+              isEdited: false,
+              isDeleted: false,
+              isSystem: true,
+              reactions: []
+            };
+            
+            if (!data.messages[chatId]) data.messages[chatId] = [];
+            data.messages[chatId].push(systemMessage);
           }
           
           saveData();
-          sendTo(ws, 'message_pinned', { 
-            chatId, 
-            pinnedMessages: data.pinnedMessages[currentUserId][chatId] 
+          
+          [user1, user2].forEach(userId => {
+            sendToUser(userId, 'message_pinned', { 
+              chatId, 
+              pinnedMessages: data.pinnedMessages[userId]?.[chatId] || [],
+              systemMessage
+            });
           });
+          break;
+        }
+        
+        case 'add_reaction': {
+          const { chatId, messageId, oderId, emoji } = msgData;
+          const oderId2 = oderId; // For compatibility
+          
+          if (data.messages[chatId]) {
+            const msg = data.messages[chatId].find(m => m.id === messageId);
+            if (msg) {
+              if (!msg.reactions) msg.reactions = [];
+              
+              // Check if user already has this exact reaction (for toggle removal)
+              const existingIndex = msg.reactions.findIndex(r => 
+                (r.userId === oderId2 || r.oderId === oderId2) && r.emoji === emoji
+              );
+              
+              if (existingIndex >= 0) {
+                // Remove existing reaction (toggle off)
+                msg.reactions.splice(existingIndex, 1);
+              } else {
+                // Remove any other reaction from this user first
+                msg.reactions = msg.reactions.filter(r => 
+                  r.userId !== oderId2 && r.oderId !== oderId2
+                );
+                // Add new reaction
+                msg.reactions.push({ userId: oderId2, emoji });
+              }
+              
+              saveData();
+              
+              const [user1, user2] = chatId.split(':');
+              [user1, user2].forEach(userId => {
+                sendToUser(userId, 'reaction_updated', { 
+                  chatId, 
+                  messageId, 
+                  reactions: msg.reactions 
+                });
+              });
+            }
+          }
           break;
         }
         
@@ -636,11 +666,9 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Get all messages for a user
 function getAllUserMessages(userId) {
   const userMessages = {};
   
-  // Get messages from all chats this user is part of
   for (const chatId of Object.keys(data.messages)) {
     const [user1, user2] = chatId.split(':');
     if (user1 === userId || user2 === userId) {
@@ -651,7 +679,13 @@ function getAllUserMessages(userId) {
   return userMessages;
 }
 
-// Start server
 server.listen(PORT, '0.0.0.0', () => {
+  const ips = getNetworkIPs();
+  
   console.log('\n🚀 Chat Server running on port', PORT);
+  console.log('   Local:   ws://localhost:' + PORT);
+  ips.forEach(ip => {
+    console.log(`   Network: ws://${ip}:${PORT}`);
+  });
+  console.log('');
 });
