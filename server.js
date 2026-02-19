@@ -534,6 +534,7 @@ wss.on('connection', (ws) => {
         case 'pin_message': {
           const { chatId, messageId, isPinned, oderId } = msgData;
           const [user1, user2] = chatId.split(':');
+          const isSavedMessages = user1 === user2;
           
           // Update pinned messages for both users
           [user1, user2].forEach(userId => {
@@ -550,9 +551,9 @@ wss.on('connection', (ws) => {
             }
           });
           
-          // Create system message for pin (only once, stored in messages)
+          // Create system message for pin (NOT for saved messages)
           let systemMessage = null;
-          if (isPinned) {
+          if (isPinned && !isSavedMessages) {
             const pinner = data.users[oderId];
             systemMessage = {
               id: `sys_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -575,19 +576,17 @@ wss.on('connection', (ws) => {
           saveData();
           
           // Send to both users
-          // The system message is stored in data.messages and needs to be sent to both users
           [user1, user2].forEach(userId => {
             const isCurrentUser = userId === currentUserId;
             sendToUser(userId, 'message_pinned', { 
               chatId, 
               pinnedMessages: data.pinnedMessages[userId]?.[chatId] || [],
-              // Send system message to current user, for other user it will come via new_message or they'll see it on refresh
               systemMessage: isCurrentUser && systemMessage ? systemMessage : null
             });
           });
           
           // Also send system message to the other user as a new_message event
-          if (systemMessage) {
+          if (systemMessage && !isSavedMessages) {
             const otherUserId = user1 === currentUserId ? user2 : user1;
             sendToUser(otherUserId, 'new_message', {
               message: systemMessage,
