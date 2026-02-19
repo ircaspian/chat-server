@@ -574,15 +574,27 @@ wss.on('connection', (ws) => {
           
           saveData();
           
-          // Send to both users - systemMessage only once (via server storage)
-          // Each user gets their own pinned list but the system message is already in messages array
+          // Send to both users
+          // The system message is stored in data.messages and needs to be sent to both users
           [user1, user2].forEach(userId => {
+            const isCurrentUser = userId === currentUserId;
             sendToUser(userId, 'message_pinned', { 
               chatId, 
               pinnedMessages: data.pinnedMessages[userId]?.[chatId] || [],
-              systemMessage: userId === currentUserId ? null : systemMessage // Only send to other user
+              // Send system message to current user, for other user it will come via new_message or they'll see it on refresh
+              systemMessage: isCurrentUser && systemMessage ? systemMessage : null
             });
           });
+          
+          // Also send system message to the other user as a new_message event
+          if (systemMessage) {
+            const otherUserId = user1 === currentUserId ? user2 : user1;
+            sendToUser(otherUserId, 'new_message', {
+              message: systemMessage,
+              chats: data.chats[otherUserId] || {},
+              senderId: currentUserId
+            });
+          }
           break;
         }
         
