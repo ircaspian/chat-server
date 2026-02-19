@@ -550,7 +550,7 @@ wss.on('connection', (ws) => {
             }
           });
           
-          // Create system message for pin
+          // Create system message for pin (only once, stored in messages)
           let systemMessage = null;
           if (isPinned) {
             const pinner = data.users[oderId];
@@ -574,11 +574,13 @@ wss.on('connection', (ws) => {
           
           saveData();
           
+          // Send to both users - systemMessage only once (via server storage)
+          // Each user gets their own pinned list but the system message is already in messages array
           [user1, user2].forEach(userId => {
             sendToUser(userId, 'message_pinned', { 
               chatId, 
               pinnedMessages: data.pinnedMessages[userId]?.[chatId] || [],
-              systemMessage
+              systemMessage: userId === currentUserId ? null : systemMessage // Only send to other user
             });
           });
           break;
