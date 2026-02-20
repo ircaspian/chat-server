@@ -410,6 +410,37 @@ wss.on('connection', (ws) => {
           break;
         }
         
+        case 'mark_messages_seen': {
+          const { chatId, userId, partnerId, messageIds } = msgData;
+          
+          if (!messageIds || messageIds.length === 0) break;
+          
+          // Mark only the specified messages as seen
+          if (data.messages[chatId]) {
+            data.messages[chatId].forEach(m => {
+              if (messageIds.includes(m.id) && m.receiverId === userId && m.status !== 'seen') {
+                m.status = 'seen';
+              }
+            });
+          }
+          
+          // Update unread count
+          if (data.chats[userId]?.[partnerId]) {
+            const currentUnread = data.chats[userId][partnerId].unreadCount || 0;
+            data.chats[userId][partnerId].unreadCount = Math.max(0, currentUnread - messageIds.length);
+          }
+          
+          saveData();
+          
+          // Notify the sender that specific messages were seen
+          sendToUser(partnerId, 'specific_messages_seen', { 
+            chatId, 
+            seenBy: userId, 
+            messageIds 
+          });
+          break;
+        }
+        
         case 'typing': {
           const { userId, partnerId, isTyping } = msgData;
           sendToUser(partnerId, 'user_typing', { userId, isTyping });
