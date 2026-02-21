@@ -194,6 +194,21 @@ wss.on('connection', (ws) => {
           
           data.users[userId].isOnline = true;
           data.users[userId].lastSeen = Date.now();
+          
+          // Mark all pending messages as delivered
+          const deliveredUpdates = [];
+          for (const chatId in data.messages) {
+            const [user1, user2] = chatId.split(':');
+            if (user1 === userId || user2 === userId) {
+              for (const msg of data.messages[chatId]) {
+                if (msg.receiverId === userId && msg.status === 'sent') {
+                  msg.status = 'delivered';
+                  deliveredUpdates.push({ messageId: msg.id, chatId });
+                }
+              }
+            }
+          }
+          
           saveData();
           
           sendTo(ws, 'login_success', {
@@ -207,6 +222,14 @@ wss.on('connection', (ws) => {
             pinnedMessages: data.pinnedMessages[userId] || {},
             onlineUsers: getOnlineUserIds()
           });
+          
+          // Broadcast delivered status to all users
+          if (deliveredUpdates.length > 0) {
+            broadcast({
+              type: 'messages_batch_delivered',
+              data: { updates: deliveredUpdates }
+            });
+          }
           
           broadcast({ 
             type: 'user_online', 
@@ -233,6 +256,21 @@ wss.on('connection', (ws) => {
           
           data.users[user.id].isOnline = true;
           data.users[user.id].lastSeen = Date.now();
+          
+          // Mark all pending messages as delivered
+          const deliveredUpdates = [];
+          for (const chatId in data.messages) {
+            const [user1, user2] = chatId.split(':');
+            if (user1 === user.id || user2 === user.id) {
+              for (const msg of data.messages[chatId]) {
+                if (msg.receiverId === user.id && msg.status === 'sent') {
+                  msg.status = 'delivered';
+                  deliveredUpdates.push({ messageId: msg.id, chatId });
+                }
+              }
+            }
+          }
+          
           saveData();
           
           sendTo(ws, 'login_success', {
@@ -246,6 +284,14 @@ wss.on('connection', (ws) => {
             pinnedMessages: data.pinnedMessages[user.id] || {},
             onlineUsers: getOnlineUserIds()
           });
+          
+          // Broadcast delivered status to all users
+          if (deliveredUpdates.length > 0) {
+            broadcast({
+              type: 'messages_batch_delivered',
+              data: { updates: deliveredUpdates }
+            });
+          }
           
           broadcast({ 
             type: 'user_online', 
@@ -437,6 +483,12 @@ wss.on('connection', (ws) => {
             chatId, 
             seenBy: userId, 
             messageIds 
+          });
+          
+          // Also send updated chat data to the current user so sidebar updates
+          sendToUser(userId, 'chat_unread_updated', {
+            partnerId,
+            unreadCount: Math.max(0, (data.chats[userId]?.[partnerId]?.unreadCount || 0))
           });
           break;
         }
