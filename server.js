@@ -384,6 +384,72 @@ wss.on('connection', (ws) => {
           break;
         }
         
+        case 'forward_message': {
+          if (!currentUserId) return;
+          
+          const { id, chatId, senderId, receiverId, text, forwardedFrom } = msgData;
+          
+          if (data.blocked[receiverId]?.includes(senderId)) {
+            sendTo(ws, 'message_blocked', { error: 'شما توسط این کاربر بلاک شده‌اید' });
+            return;
+          }
+          
+          if (data.users[receiverId]?.isDeleted) {
+            sendTo(ws, 'message_blocked', { error: 'این کاربر حذف شده است' });
+            return;
+          }
+          
+          const message = {
+            id,
+            chatId,
+            senderId,
+            receiverId,
+            text,
+            replyTo: null,
+            timestamp: Date.now(),
+            status: 'sent',
+            isEdited: false,
+            isDeleted: false,
+            reactions: [],
+            forwardedFrom: forwardedFrom || null
+          };
+          
+          if (!data.messages[chatId]) data.messages[chatId] = [];
+          data.messages[chatId].push(message);
+          
+          ensureChat(senderId, receiverId);
+          ensureChat(receiverId, senderId);
+          
+          data.chats[senderId][receiverId].lastMessage = message;
+          data.chats[senderId][receiverId].updatedAt = Date.now();
+          
+          data.chats[receiverId][senderId].lastMessage = message;
+          data.chats[receiverId][senderId].updatedAt = Date.now();
+          data.chats[receiverId][senderId].unreadCount = 
+            (data.chats[receiverId][senderId].unreadCount || 0) + 1;
+          
+          saveData();
+          
+          sendTo(ws, 'message_sent', { 
+            message: { ...message, status: 'sent' },
+            chats: data.chats[senderId]
+          });
+          
+          const receiverWs = onlineUsers.get(receiverId);
+          if (receiverWs) {
+            message.status = 'delivered';
+            sendTo(receiverWs, 'new_message', { 
+              message,
+              chats: data.chats[receiverId],
+              senderId
+            });
+            
+            sendTo(ws, 'message_delivered', { messageId: id, chatId });
+          }
+          
+          break;
+        }
+        
         case 'edit_message': {
           const { chatId, messageId, newText } = msgData;
           
