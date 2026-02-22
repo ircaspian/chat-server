@@ -2,6 +2,7 @@ const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const PORT = process.env.PORT || 3001;
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -11,6 +12,8 @@ let data = {
   users: {},
   messages: {},
   chats: {},
+  groups: {},
+  groupMessages: {},
   blocked: {},
   blockedBy: {},
   pinnedChats: {},
@@ -24,6 +27,9 @@ if (fs.existsSync(DATA_FILE)) {
     console.log('Error loading data, starting fresh');
   }
 }
+
+if (!data.groups) data.groups = {};
+if (!data.groupMessages) data.groupMessages = {};
 
 // Save data
 function saveData() {
@@ -39,6 +45,20 @@ function generateRecoveryCode() {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
+}
+
+// Get network IPs
+function getNetworkIPs() {
+  const interfaces = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ips.push(iface.address);
+      }
+    }
+  }
+  return ips;
 }
 
 // Online users
@@ -169,7 +189,9 @@ wss.on('connection', (ws) => {
             user,
             users: data.users,
             chats: data.chats[id] || {},
+            groups: getUserGroups(id),
             messages: getAllUserMessages(id),
+            groupMessages: getUserGroupMessages(id),
             blocked: data.blocked[id] || [],
             blockedBy: data.blockedBy[id] || [],
             pinnedChats: data.pinnedChats[id] || [],
@@ -215,7 +237,9 @@ wss.on('connection', (ws) => {
             user: data.users[userId],
             users: data.users,
             chats: data.chats[userId] || {},
+            groups: getUserGroups(userId),
             messages: getAllUserMessages(userId),
+            groupMessages: getUserGroupMessages(userId),
             blocked: data.blocked[userId] || [],
             blockedBy: data.blockedBy[userId] || [],
             pinnedChats: data.pinnedChats[userId] || [],
@@ -277,7 +301,9 @@ wss.on('connection', (ws) => {
             user: data.users[user.id],
             users: data.users,
             chats: data.chats[user.id] || {},
+            groups: getUserGroups(user.id),
             messages: getAllUserMessages(user.id),
+            groupMessages: getUserGroupMessages(user.id),
             blocked: data.blocked[user.id] || [],
             blockedBy: data.blockedBy[user.id] || [],
             pinnedChats: data.pinnedChats[user.id] || [],
@@ -316,6 +342,358 @@ wss.on('connection', (ws) => {
             u => u.username.toLowerCase() === searchTerm && !u.isDeleted
           );
           sendTo(ws, 'search_result', { user: user ? { ...user, recoveryCode: undefined } : null });
+          break;
+        }
+
+        case 'create_group': {
+          if (!currentUserId) return;
+
+          const { id, name, description, avatar, memberIds = [] } = msgData;
+          if (!name || !String(name).trim()) return;
+
+          const uniqueMembers = Array.from(new Set([currentUserId, ...(memberIds || [])]))
+            .filter(userId => data.users[userId] && !data.users[userId].isDeleted);
+
+          const group = {
+            id,
+            name: String(name).trim(),
+            description: description ? String(description).trim() : '',
+            avatar: avatar || '👥',
+            creatorId: currentUserId,
+            memberIds: uniqueMembers,
+            admins: [currentUserId],
+            createdAt: Date.now(),
+            isDeleted: false,
+            unreadCounts: uniqueMembers.reduce((acc, userId) => {
+              acc[userId] = 0;
+              return acc;
+            }, {})
+          };
+
+          data.groups[id] = group;
+          if (!data.groupMessages[id]) data.groupMessages[id] = [];
+          saveData();
+
+          uniqueMembers.forEach(userId => {
+            sendToUser(userId, 'group_created', { group });
+          });
+          break;
+        }
+
+        case 'send_group_message': {
+          if (!currentUserId) return;
+
+          const { id, groupId, senderId, text, replyTo, forwardedFrom } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(currentUserId)) return;
+          if (!text || !String(text).trim()) return;
+
+          const message = {
+            id,
+            chatId: `group:${groupId}`,
+            groupId,
+            senderId,
+            text: String(text).trim(),
+            replyTo: replyTo || null,
+            forwardedFrom: forwardedFrom || null,
+            timestamp: Date.now(),
+            status: 'sent',
+            isEdited: false,
+            isDeleted: false,
+            reactions: [],
+            seenBy: [senderId]
+          };
+
+          if (!data.groupMessages[groupId]) data.groupMessages[groupId] = [];
+          data.groupMessages[groupId].push(message);
+
+          group.lastMessage = message;
+          if (!group.unreadCounts) group.unreadCounts = {};
+          group.memberIds.forEach(userId => {
+            if (userId !== senderId) {
+              group.unreadCounts[userId] = (group.unreadCounts[userId] || 0) + 1;
+            } else {
+              group.unreadCounts[userId] = 0;
+            }
+          });
+
+          saveData();
+
+          sendToUser(senderId, 'group_message_sent', { groupId, message, group });
+          group.memberIds
+            .filter(userId => userId !== senderId)
+            .forEach(userId => {
+              sendToUser(userId, 'new_group_message', { groupId, message, group });
+            });
+          break;
+        }
+
+        case 'forward_group_message': {
+          if (!currentUserId) return;
+          const { id, groupId, senderId, text, forwardedFrom } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(currentUserId)) return;
+          if (!text || !String(text).trim()) return;
+
+          const message = {
+            id,
+            chatId: `group:${groupId}`,
+            groupId,
+            senderId,
+            text: String(text).trim(),
+            replyTo: null,
+            forwardedFrom: forwardedFrom || null,
+            timestamp: Date.now(),
+            status: 'sent',
+            isEdited: false,
+            isDeleted: false,
+            reactions: [],
+            seenBy: [senderId]
+          };
+
+          if (!data.groupMessages[groupId]) data.groupMessages[groupId] = [];
+          data.groupMessages[groupId].push(message);
+
+          group.lastMessage = message;
+          if (!group.unreadCounts) group.unreadCounts = {};
+          group.memberIds.forEach(userId => {
+            if (userId !== senderId) {
+              group.unreadCounts[userId] = (group.unreadCounts[userId] || 0) + 1;
+            } else {
+              group.unreadCounts[userId] = 0;
+            }
+          });
+
+          saveData();
+
+          sendToUser(senderId, 'group_message_sent', { groupId, message, group });
+          group.memberIds
+            .filter(userId => userId !== senderId)
+            .forEach(userId => {
+              sendToUser(userId, 'new_group_message', { groupId, message, group });
+            });
+          break;
+        }
+
+        case 'mark_group_seen': {
+          if (!currentUserId) return;
+          const { groupId, userId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(userId)) return;
+          if (!data.groupMessages[groupId]) data.groupMessages[groupId] = [];
+          if (!group.unreadCounts) group.unreadCounts = {};
+          const msgs = data.groupMessages[groupId];
+          const seenIds = [];
+          msgs.forEach(m => {
+            if (m.isSystem || m.senderId === userId) return;
+            if (!Array.isArray(m.seenBy)) m.seenBy = [m.senderId].filter(Boolean);
+            if (!m.seenBy.includes(userId)) {
+              m.seenBy.push(userId);
+              seenIds.push(m.id);
+            }
+          });
+          group.unreadCounts[userId] = 0;
+          saveData();
+          sendToUser(userId, 'group_unread_updated', { group });
+          if (seenIds.length > 0) {
+            group.memberIds.forEach(memberId => {
+              sendToUser(memberId, 'group_messages_seen', { groupId, userId, messageIds: seenIds });
+            });
+          }
+          break;
+        }
+
+        case 'mark_group_messages_seen': {
+          if (!currentUserId) return;
+          const { groupId, userId, messageIds } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (userId !== currentUserId) return;
+          if (!group.memberIds.includes(userId)) return;
+          if (!Array.isArray(messageIds) || messageIds.length === 0) return;
+          if (!data.groupMessages[groupId]) data.groupMessages[groupId] = [];
+          if (!group.unreadCounts) group.unreadCounts = {};
+
+          const targetIds = new Set(messageIds);
+          const seenIds = [];
+          for (const m of data.groupMessages[groupId]) {
+            if (!targetIds.has(m.id)) continue;
+            if (m.isSystem || m.senderId === userId) continue;
+            if (!Array.isArray(m.seenBy)) m.seenBy = [m.senderId].filter(Boolean);
+            if (!m.seenBy.includes(userId)) {
+              m.seenBy.push(userId);
+              seenIds.push(m.id);
+            }
+          }
+
+          if (seenIds.length === 0) return;
+
+          const currentUnread = group.unreadCounts[userId] || 0;
+          group.unreadCounts[userId] = Math.max(0, currentUnread - seenIds.length);
+          saveData();
+
+          sendToUser(userId, 'group_unread_updated', { group });
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_messages_seen', { groupId, userId, messageIds: seenIds });
+          });
+          break;
+        }
+
+        case 'edit_group_message': {
+          if (!currentUserId) return;
+          const { groupId, messageId, newText, userId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(userId)) return;
+          const msgs = data.groupMessages[groupId] || [];
+          const msg = msgs.find(m => m.id === messageId);
+          if (!msg || msg.senderId !== userId) return;
+          msg.text = String(newText || '').trim();
+          msg.isEdited = true;
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_message_edited', { groupId, messageId, newText: msg.text });
+          });
+          break;
+        }
+
+        case 'delete_group_message': {
+          if (!currentUserId) return;
+          const { groupId, messageIds, userId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(userId)) return;
+          const ids = new Set(messageIds || []);
+          const msgs = data.groupMessages[groupId] || [];
+          const canDelete = new Set(
+            msgs.filter(m => ids.has(m.id) && (m.senderId === userId || group.admins?.includes(userId))).map(m => m.id)
+          );
+          data.groupMessages[groupId] = msgs.filter(m => !canDelete.has(m.id));
+          if (group.pinnedMessageIds) {
+            group.pinnedMessageIds = group.pinnedMessageIds.filter(id => !canDelete.has(id));
+          }
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_message_deleted', { groupId, messageIds: Array.from(canDelete) });
+          });
+          break;
+        }
+
+        case 'pin_group_message': {
+          if (!currentUserId) return;
+          const { groupId, messageId, isPinned, userId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(userId)) return;
+          if (!group.admins?.includes(userId) && group.creatorId !== userId) return;
+          if (!group.pinnedMessageIds) group.pinnedMessageIds = [];
+          if (isPinned) {
+            if (!group.pinnedMessageIds.includes(messageId)) {
+              group.pinnedMessageIds.push(messageId);
+            }
+          } else {
+            group.pinnedMessageIds = group.pinnedMessageIds.filter(id => id !== messageId);
+          }
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_message_pinned', { group });
+          });
+          break;
+        }
+
+        case 'add_group_member': {
+          if (!currentUserId) return;
+          const { groupId, userId, actorId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (actorId !== currentUserId) return;
+          const canManage = group.creatorId === actorId || group.admins?.includes(actorId);
+          if (!canManage) return;
+          if (!data.users[userId] || data.users[userId].isDeleted) return;
+          if (!group.memberIds.includes(userId)) {
+            group.memberIds.push(userId);
+          }
+          if (!group.unreadCounts) group.unreadCounts = {};
+          group.unreadCounts[userId] = group.unreadCounts[userId] || 0;
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_updated', { group, groupId });
+          });
+          sendToUser(userId, 'group_updated', { group, groupId });
+          break;
+        }
+
+        case 'remove_group_member': {
+          if (!currentUserId) return;
+          const { groupId, userId, actorId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (actorId !== currentUserId) return;
+          const canManage = group.creatorId === actorId || group.admins?.includes(actorId) || actorId === userId;
+          if (!canManage) return;
+          if (userId === group.creatorId) return;
+          group.memberIds = (group.memberIds || []).filter(id => id !== userId);
+          group.admins = (group.admins || []).filter(id => id !== userId);
+          if (group.unreadCounts) delete group.unreadCounts[userId];
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_updated', { group, groupId });
+          });
+          sendToUser(userId, 'group_updated', { group: null, groupId });
+          break;
+        }
+
+        case 'set_group_admin': {
+          if (!currentUserId) return;
+          const { groupId, userId, isAdmin, actorId } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (actorId !== currentUserId) return;
+          if (group.creatorId !== actorId) return;
+          if (!group.memberIds.includes(userId)) return;
+          if (!group.admins) group.admins = [group.creatorId];
+          if (isAdmin) {
+            if (!group.admins.includes(userId)) group.admins.push(userId);
+          } else if (userId !== group.creatorId) {
+            group.admins = group.admins.filter(id => id !== userId);
+          }
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_updated', { group, groupId });
+          });
+          break;
+        }
+
+        case 'add_group_reaction': {
+          if (!currentUserId) return;
+          const { groupId, messageId, userId, emoji } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) return;
+          if (!group.memberIds.includes(userId)) return;
+          const msgs = data.groupMessages[groupId] || [];
+          const msg = msgs.find(m => m.id === messageId);
+          if (!msg) return;
+          if (!msg.reactions) msg.reactions = [];
+          const existingIndex = msg.reactions.findIndex(r =>
+            (r.userId === userId || r.oderId === userId) && r.emoji === emoji
+          );
+          if (existingIndex >= 0) {
+            msg.reactions.splice(existingIndex, 1);
+          } else {
+            msg.reactions = msg.reactions.filter(r => r.userId !== userId && r.oderId !== userId);
+            msg.reactions.push({ userId, emoji });
+          }
+          saveData();
+          group.memberIds.forEach(memberId => {
+            sendToUser(memberId, 'group_reaction_updated', {
+              groupId,
+              messageId,
+              reactions: msg.reactions
+            });
+          });
           break;
         }
         
@@ -562,6 +940,19 @@ wss.on('connection', (ws) => {
         case 'typing': {
           const { userId, partnerId, isTyping } = msgData;
           sendToUser(partnerId, 'user_typing', { userId, isTyping });
+          break;
+        }
+
+        case 'group_typing': {
+          const { groupId, userId, isTyping } = msgData;
+          const group = data.groups[groupId];
+          if (!group || group.isDeleted) break;
+          if (!group.memberIds.includes(userId)) break;
+          group.memberIds
+            .filter(memberId => memberId !== userId)
+            .forEach(memberId => {
+              sendToUser(memberId, 'group_user_typing', { groupId, userId, isTyping });
+            });
           break;
         }
         
@@ -840,8 +1231,32 @@ function getAllUserMessages(userId) {
   return userMessages;
 }
 
+function getUserGroups(userId) {
+  const result = {};
+  for (const [groupId, group] of Object.entries(data.groups || {})) {
+    if (group.memberIds?.includes(userId) && !group.isDeleted) {
+      result[groupId] = group;
+    }
+  }
+  return result;
+}
+
+function getUserGroupMessages(userId) {
+  const result = {};
+  const groups = getUserGroups(userId);
+  for (const groupId of Object.keys(groups)) {
+    result[groupId] = data.groupMessages[groupId] || [];
+  }
+  return result;
+}
+
 server.listen(PORT, '0.0.0.0', () => {
+  const ips = getNetworkIPs();
+  
   console.log('\n🚀 Chat Server running on port', PORT);
-  console.log('   Health check: /health');
+  console.log('   Local:   ws://localhost:' + PORT);
+  ips.forEach(ip => {
+    console.log(`   Network: ws://${ip}:${PORT}`);
+  });
   console.log('');
 });
